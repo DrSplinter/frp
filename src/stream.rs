@@ -1,3 +1,4 @@
+use std::future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -16,6 +17,18 @@ pub trait FrpStreamExt: Stream + Sized {
             stream: Some(self),
             first: Some(first),
         }
+    }
+
+    fn accumulate<A, F>(self, init: A, f: F) -> impl Signal<Item = A>
+    where
+        A: Clone,
+        F: Fn(A, Self::Item) -> A + 'static,
+    {
+        self.scan(init.clone(), move |state, next| {
+            *state = f(state.clone(), next);
+            future::ready(Some(state.clone()))
+        })
+        .to_signal(init)
     }
 
     fn merge<S: Stream>(self, other: S) -> impl Stream<Item = Self::Item>
