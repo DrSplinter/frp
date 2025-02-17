@@ -1,5 +1,8 @@
 use futures::{stream, FutureExt, Stream, StreamExt};
-use futures_signals::signal::{Mutable, ReadOnlyMutable, Signal, SignalExt};
+use futures_signals::signal::{
+    Mutable, MutableSignal, MutableSignalCloned, MutableSignalRef, ReadOnlyMutable, Signal,
+    SignalExt,
+};
 
 use crate::stream::FrpStreamExt;
 
@@ -32,26 +35,48 @@ pub trait FrpSignalExt: Signal {
 
 impl<S: Signal> FrpSignalExt for S {}
 
-pub fn pending<T>(value: T) -> impl Signal<Item = T> {
+pub fn pending<A>(value: A) -> impl Signal<Item = A> {
     stream::pending().to_signal(value)
 }
 
-pub fn recursive<T, F, S>(init: T, get_changes: F) -> ReadOnlyMutable<T>
-where
-    T: Copy + Send + Sync + 'static,
-    F: FnOnce(ReadOnlyMutable<T>) -> S,
-    S: Stream<Item = T> + Send + 'static,
-{
-    let state = Mutable::new(init);
-    let changes = get_changes(state.read_only());
+pub fn placeholder<A>(init: A) -> Placeholder<A> {
+    Placeholder {
+        value: Mutable::new(init),
+    }
+}
 
-    tokio::spawn({
-        let state = state.clone();
-        changes.for_each(move |value| {
-            state.set(value);
-            futures::future::ready(())
-        })
-    });
+pub struct Placeholder<A> {
+    value: Mutable<A>,
+}
 
-    state.read_only()
+impl<A: Copy> Placeholder<A> {
+    pub fn signal(&self) -> MutableSignal<A> {
+        self.value.signal()
+    }
+}
+
+impl<A: Clone> Placeholder<A> {
+    pub fn signal_cloned(&self) -> MutableSignalCloned<A> {
+        self.value.signal_cloned()
+    }
+}
+
+impl<A: Send + Sync + 'static> Placeholder<A> {
+    pub fn signal_ref<F: FnMut(&A) -> B, B>(&self, f: F) -> MutableSignalRef<A, F> {
+        self.value.signal_ref(f)
+    }
+
+    pub fn fill(self, changes: impl Stream<Item = A> + Send + 'static) -> ReadOnlyMutable<A> {
+        let state = self.value.clone();
+
+        tokio::spawn({
+            let state = state.clone();
+            changes.for_each(move |value| {
+                state.set(value);
+                futures::future::ready(())
+            })
+        });
+
+        state.read_only()
+    }
 }
