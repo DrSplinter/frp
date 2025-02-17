@@ -1,7 +1,8 @@
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use futures_signals::signal::Signal;
 use pin_project::pin_project;
 
@@ -89,6 +90,184 @@ where
                 }
             }
         }
+    }
+}
+
+pub struct Broadcaster<A> {
+    senders: Arc<Mutex<Vec<Box<dyn Fn(&A) -> bool + Send>>>>,
+}
+
+impl<A> Clone for Broadcaster<A> {
+    fn clone(&self) -> Self {
+        Self {
+            senders: self.senders.clone(),
+        }
+    }
+}
+
+impl<A> Broadcaster<A> {
+    pub fn new() -> Self {
+        Self {
+            senders: Arc::new(Mutex::new(vec![])),
+        }
+    }
+
+    pub fn read_only(&self) -> ReadOnlyBroadcaster<A> {
+        ReadOnlyBroadcaster {
+            broadcaster: self.clone(),
+        }
+    }
+
+    fn receiver<F: Fn(&A) -> B + Send + 'static, B: Send + 'static>(
+        &self,
+        f: F,
+    ) -> futures::channel::mpsc::UnboundedReceiver<B> {
+        let (sender, receiver) = futures::channel::mpsc::unbounded();
+
+        self.senders
+            .lock()
+            .unwrap()
+            .push(Box::new(move |a| sender.unbounded_send(f(a)).is_ok()));
+
+        receiver
+    }
+
+    pub fn send(&self, value: A) {
+        let mut senders = self.senders.lock().unwrap();
+
+        senders.retain(|sender| sender(&value))
+    }
+}
+
+impl<A> Broadcaster<A> {
+    pub fn stream_ref<F: Fn(&A) -> B + Send + 'static, B: Send + 'static>(
+        &self,
+        f: F,
+    ) -> BroadcasterStreamRef<B> {
+        let receiver = self.receiver(f);
+
+        BroadcasterStreamRef { receiver }
+    }
+}
+
+impl<A: Copy + Send + 'static> Broadcaster<A> {
+    pub fn stream(&self) -> BroadcasterStream<A> {
+        let receiver = self.receiver(|a| *a);
+
+        BroadcasterStream { receiver }
+    }
+}
+
+impl<A: Clone + Send + 'static> Broadcaster<A> {
+    pub fn stream_cloned(&self) -> BroadcasterStreamCloned<A> {
+        let receiver = self.receiver(Clone::clone);
+
+        BroadcasterStreamCloned { receiver }
+    }
+}
+
+#[pin_project]
+#[derive(Debug)]
+#[must_use = "Streams do nothing unless polled"]
+pub struct BroadcasterStream<A> {
+    #[pin]
+    receiver: futures::channel::mpsc::UnboundedReceiver<A>,
+}
+
+impl<A> Stream for BroadcasterStream<A> {
+    type Item = A;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        self.project().receiver.poll_next(cx)
+    }
+}
+
+#[pin_project]
+#[derive(Debug)]
+#[must_use = "Streams do nothing unless polled"]
+pub struct BroadcasterStreamCloned<A> {
+    #[pin]
+    receiver: futures::channel::mpsc::UnboundedReceiver<A>,
+}
+
+impl<A> Stream for BroadcasterStreamCloned<A> {
+    type Item = A;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        self.project().receiver.poll_next(cx)
+    }
+}
+
+#[pin_project]
+#[derive(Debug)]
+#[must_use = "Streams do nothing unless polled"]
+pub struct BroadcasterStreamRef<A> {
+    #[pin]
+    receiver: futures::channel::mpsc::UnboundedReceiver<A>,
+}
+
+impl<A> Stream for BroadcasterStreamRef<A> {
+    type Item = A;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        self.project().receiver.poll_next(cx)
+    }
+}
+
+pub struct ReadOnlyBroadcaster<A> {
+    broadcaster: Broadcaster<A>,
+}
+
+impl<A> ReadOnlyBroadcaster<A> {
+    pub fn stream_ref<F: Fn(&A) -> B + Send + 'static, B: Send + 'static>(
+        &self,
+        f: F,
+    ) -> BroadcasterStreamRef<B> {
+        self.broadcaster.stream_ref(f)
+    }
+}
+
+impl<A: Copy + Send + 'static> ReadOnlyBroadcaster<A> {
+    pub fn stream(&self) -> BroadcasterStream<A> {
+        self.broadcaster.stream()
+    }
+}
+
+impl<A: Clone + Send + 'static> ReadOnlyBroadcaster<A> {
+    pub fn stream_cloned(&self) -> BroadcasterStreamCloned<A> {
+        self.broadcaster.stream_cloned()
+    }
+}
+
+pub fn placeholder<A>() -> Placeholder<A> {
+    Placeholder {
+        broadcaster: Broadcaster::new(),
+    }
+}
+
+pub struct Placeholder<A> {
+    broadcaster: Broadcaster<A>,
+}
+
+impl<A: Copy + Send + 'static> Placeholder<A> {
+    pub fn stream(&self) -> BroadcasterStream<A> {
+        self.broadcaster.stream()
+    }
+}
+
+impl<A: 'static> Placeholder<A> {
+    pub fn fill(self, stream: impl Stream<Item = A> + Send + 'static) -> ReadOnlyBroadcaster<A> {
+        let broadcaster = self.broadcaster.clone();
+
+        tokio::spawn({
+            stream.for_each(move |value| {
+                self.broadcaster.send(value);
+
+                futures::future::ready(())
+            })
+        });
+
+        broadcaster.read_only()
     }
 }
 
